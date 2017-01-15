@@ -5,28 +5,24 @@
 #ifndef MBED_BME280_H
 #define MBED_BME280_H
 
-#include <Wire.h>
-
-#define BME280_ADDRESS 0x76
-
 class BME280
 {
 public:
     BME280(void);
 
     virtual ~BME280();
-  
-    void begin(int sda, int sck);
-  
+
+    void begin(int cs);
+
     double readTemperature(void);
-  
-    double readPressure(void);
-  
+
     double readHumidity(void);
+
+    double readPressure(void);
 
 private:
     signed long int t_fine;
-  
+
     uint16_t dig_T1;
      int16_t dig_T2;
      int16_t dig_T3;
@@ -45,11 +41,11 @@ private:
      int16_t dig_H4;
      int16_t dig_H5;
      int8_t  dig_H6;
-  
+
     void writeReg(uint8_t reg_address, uint8_t data);
+    void readReg(uint8_t reg_address, int numBytes,  uint8_t * data);
     void readTrim(void);
+    int bme280_cs;
 };
 
 #endif // MBED_BME280_H
-
-

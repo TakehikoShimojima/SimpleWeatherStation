@@ -2,7 +2,9 @@
  * Modified from Switchscience BME280 sample code.
  * https://github.com/SWITCHSCIENCE/BME280/blob/master/Arduino/BME280_I2C/BME280_I2C.ino
  */
-#include "BME280.h"
+#include <ESP8266WiFi.h>
+#include <SPI.h>
+#include "BME280_SPI.h"
 
 BME280::BME280() {
 }
@@ -10,7 +12,7 @@ BME280::BME280() {
 BME280::~BME280() {
 }
 
-void BME280::begin(int sda, int sck) {
+void BME280::begin(int cs) {
     uint8_t osrs_t = 1;             //Temperature oversampling x 1
     uint8_t osrs_p = 1;             //Pressure oversampling x 1
     uint8_t osrs_h = 1;             //Humidity oversampling x 1
@@ -22,30 +24,27 @@ void BME280::begin(int sda, int sck) {
     uint8_t ctrl_meas_reg = (osrs_t << 5) | (osrs_p << 2) | mode;
     uint8_t config_reg    = (t_sb << 5) | (filter << 2) | spi3w_en;
     uint8_t ctrl_hum_reg  = osrs_h;
-  
-    Wire.begin(sda, sck);
+
+    bme280_cs = cs;
+    pinMode(cs, OUTPUT);
+    SPI.begin();
+    SPI.setBitOrder (MSBFIRST);
 
     writeReg(0xF2,ctrl_hum_reg);
     writeReg(0xF4,ctrl_meas_reg);
     writeReg(0xF5,config_reg);
-    readTrim();                    //
+    readTrim();    
 }
 
 double BME280::readTemperature(void) {
     unsigned long int temp_raw;
     signed long int var1, var2;
   
-    int i = 0;
-    uint32_t data[8];
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0xfa);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,3);
-    while(Wire.available()){
-        data[i] = Wire.read();
-        i++;
-    }
-    temp_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4);
+    uint8_t data[8];
+
+    readReg(0xfa, 3, data);
+
+    temp_raw = ((uint32_t)data[0] << 12) | ((uint32_t)data[1] << 4) | ((uint32_t)data[2] >> 4);
   
     var1 = ((((temp_raw >> 3) - ((signed long int)dig_T1<<1))) * ((signed long int)dig_T2)) >> 11;
     var2 = (((((temp_raw >> 4) - ((signed long int)dig_T1)) * ((temp_raw>>4) - ((signed long int)dig_T1))) >> 12) * ((signed long int)dig_T3)) >> 14;
@@ -60,17 +59,11 @@ double BME280::readPressure(void) {
     signed long int var1, var2;
     unsigned long int P;
   
-    int i = 0;
-    uint32_t data[8];
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0xf7);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,3);
-    while(Wire.available()){
-        data[i] = Wire.read();
-        i++;
-    }
-    pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4);
+    uint8_t data[8];
+
+    readReg(0xf7, 3, data);
+
+    pres_raw = ((uint32_t)data[0] << 12) | ((uint32_t)data[1] << 4) | ((uint32_t)data[2] >> 4);
   
     var1 = (((signed long int)t_fine)>>1) - (signed long int)64000;
     var2 = (((var1>>2) * (var1>>2)) >> 11) * ((signed long int)dig_P6);
@@ -97,17 +90,11 @@ double BME280::readHumidity(void) {
     unsigned long int hum_raw;
     signed long int v_x1;
   
-    int i = 0;
-    uint32_t data[8];
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0xfd);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,3);
-    while(Wire.available()){
-        data[i] = Wire.read();
-        i++;
-    }
-    hum_raw  = (data[0] << 8) | data[1];
+    uint8_t data[8];
+
+    readReg(0xfd, 3, data);
+
+    hum_raw  = ((uint32_t)data[0] << 8) | (uint32_t)data[1];
   
     v_x1 = (t_fine - ((signed long int)76800));
     v_x1 = (((((hum_raw << 14) -(((signed long int)dig_H4) << 20) - (((signed long int)dig_H5) * v_x1)) + 
@@ -121,38 +108,29 @@ double BME280::readHumidity(void) {
 }
 
 void BME280::writeReg(uint8_t reg_address, uint8_t data) {
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(reg_address);
-    Wire.write(data);
-    Wire.endTransmission();
+    digitalWrite(bme280_cs, LOW);
+    SPI.transfer(reg_address & B01111111);
+    SPI.transfer(data);
+    digitalWrite(bme280_cs, HIGH);
+}
+
+void BME280::readReg(uint8_t reg_address, int numBytes, uint8_t * data) {
+    uint8_t addr = reg_address | B10000000;
+    digitalWrite(bme280_cs, LOW);
+    SPI.transfer(addr);
+    for (int i = 0; i < numBytes; i++) {
+        data[i] = SPI.transfer(0x00);
+    }
+    digitalWrite(bme280_cs, HIGH);
 }
 
 void BME280::readTrim() {
     uint8_t data[32],i=0;
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0x88);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,24);
-    while(Wire.available()){
-        data[i] = Wire.read();
-        i++;
-    }
-    
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0xA1);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,1);
-    data[i] = Wire.read();
-    i++;
-    
-    Wire.beginTransmission(BME280_ADDRESS);
-    Wire.write(0xE1);
-    Wire.endTransmission();
-    Wire.requestFrom(BME280_ADDRESS,7);
-    while(Wire.available()){
-        data[i] = Wire.read();
-        i++;    
-    }
+
+    readReg(0x88, 24, data);
+    readReg(0xA1,  1, &data[24]);
+    readReg(0xE1,  7, &data[25]);
+
     dig_T1 = (data[1] << 8) | data[0];
     dig_T2 = (data[3] << 8) | data[2];
     dig_T3 = (data[5] << 8) | data[4];
@@ -171,5 +149,29 @@ void BME280::readTrim() {
     dig_H4 = (data[28]<< 4) | (0x0F & data[29]);
     dig_H5 = (data[30] << 4) | ((data[29] >> 4) & 0x0F);
     dig_H6 = data[31];   
+
+#if 0
+    Serial.print("T1:");Serial.print(dig_T1);
+    Serial.print(", T2:");Serial.print(dig_T2);
+    Serial.print(", T3:");Serial.print(dig_T3);
+    Serial.print("\r\n");
+    Serial.print("P1:");Serial.print(dig_P1);
+    Serial.print(", P2:");Serial.print(dig_P2);
+    Serial.print(", P3:");Serial.print(dig_P3);
+    Serial.print(", P4:");Serial.print(dig_P4);
+    Serial.print(", P5:");Serial.print(dig_P5);
+    Serial.print(", P6:");Serial.print(dig_P6);
+    Serial.print(", P7:");Serial.print(dig_P7);
+    Serial.print(", P8:");Serial.print(dig_P8);
+    Serial.print(", P9:");Serial.print(dig_P9);
+    Serial.print("\r\n");
+    Serial.print("H1:");Serial.print(dig_H1);
+    Serial.print(", H2:");Serial.print(dig_H2);
+    Serial.print(", H3:");Serial.print(dig_H3);
+    Serial.print(", H4:");Serial.print(dig_H4);
+    Serial.print(", H5:");Serial.print(dig_H5);
+    Serial.print(", H6:");Serial.print(dig_H6);
+    Serial.print("\r\n");
+#endif
 }
 

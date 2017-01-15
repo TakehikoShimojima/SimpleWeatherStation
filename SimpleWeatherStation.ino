@@ -1,17 +1,21 @@
 /*
- * BME280を使った温度・湿度・気圧ロガー
+ * BME280とNJL7502Lを使った温度・湿度・気圧+照度ロガー
+ * NJL7502LをADコンバーターMCP3002で読む。
+ * RTCモジュールを使わず、deepSleep直前の時刻とdeepSleep時間から
+ * deepSleep後の時刻を計算する
  * 
- * 立ち上がったら時刻とBME280の値を読む
- * rtcメモリーからデーターを読み、有効か確認(CRCを確認)
+ * 立ち上がったらRTCメモリーからRTCメモリーからdeepSleep直前の時刻と
+ * deepSleep時間を読み、現在時刻を計算してシステムに設定(setTime)
+ * BME280の値を読む
  * restartの値により処理を分ける
  * restart==0  wi-fi onで起動。valid==trueならデーターを送信。
  * ++restartし、バッファーに時刻とBME280の値を書く
  */
 #include <ESP8266WiFi.h>
-#include <Wire.h>
+#include <SPI.h>
 #include <TimeLib.h>
-#include "RX8025.h"
-#include "BME280.h"
+#include "BME280_SPI.h"
+#include "MCP3002.h"
 #include "Ambient.h"
 
 extern "C" {
@@ -19,22 +23,32 @@ extern "C" {
 #include "sntp.h"
 }
 
+unsigned int channelId = 100;
+const char* writeKey = "...writeKey...";
+
+const char* ssid = "...ssid...";
+const char* password = "...password...";
+
 uint32_t getSntpTime(void);
 uint32_t calcCRC32(const uint8_t *data, size_t length);
-void sendDataToAmbient();
+void sendDataToAmbient(bool valid);
 
 #define _DEBUG 1
 #if _DEBUG
 #define DBG(...) { Serial.print(__VA_ARGS__); }
+#define DBGLED(...) { digitalWrite(__VA_ARGS__); }
 #else
 #define DBG(...)
+#define DBGLED(...)
 #endif /* _DBG */
 
-#define SDA 14
-#define SCL 13
+#define LED 4
+#define MCP_CS 5
+#define BME_CS 15
 
 #define MaxRestart 6
 #define PERIOD 300
+#define COMP 0.978
 
 #pragma pack(push)
 #pragma pack(4)
@@ -43,6 +57,7 @@ struct OneData_t {
     double temp;
     double humid;
     double pressure;
+    double illumi;
 };
 
 #define MaxDataArea  (512 - sizeof(uint32_t) - sizeof(int) - sizeof(time_t))
@@ -51,7 +66,8 @@ struct OneData_t {
 struct Data {
     uint32_t crc32;
     int    restart;
-    time_t nextAdjust;
+    time_t tbefore;
+    time_t sleeptime;
     struct OneData_t blocks[MaxBlocks];
 };
 
@@ -62,51 +78,21 @@ union {
 
 #pragma pack(pop)
 
-const char* ssid = "...ssid...";
-const char* password = "...password...";
 WiFiClient client;
-
-unsigned int channelId = 100;
-const char* writeKey = "...writeKey...";
 Ambient ambient;
 
-RX8025 rx8025;
+MCP3002 mcp3002;
 BME280 bme280;
 
 void setup()
 {
     bool valid;  //  RTCメモリーの値が有効かどうかのフラグ
     int restart;  //  何回目の起動かのカウンター。0の時はWi-Fiオンで起動されている
+    time_t currenttime;
+    double sleeptime;
+    time_t sntptime;
 
     int t = millis();
-
-#ifdef _DEBUG
-    Serial.begin(115200);
-    delay(10);
-#endif
-    DBG("\r\nStart\r\n");
-
-    Wire.begin(SDA, SCL);
-
-    bme280.begin(SDA, SCL);  //  Wi-Fi接続には時間がかかり、測定周期がぶれるので、
-                             //  Wi-Fi接続より先にセンサーを読んでしまう
-
-    time_t currentTime;
-    double temp, humid, pressure;
-
-    //  電源オン直後(rx8025.needInit()がtrue)はRTCの値が不定なので読まない
-    currentTime = rx8025.needInit() ? 0 : rx8025.readRTC();
-
-    temp = bme280.readTemperature();
-    humid = bme280.readHumidity();
-    pressure = bme280.readPressure();
-
-    DBG("currentTime: "); DBG(currentTime);
-    DBG(", temp: "); DBG(temp);
-    DBG(" DegC,  humid: "); DBG(humid);
-    DBG(" %, pressure: "); DBG(pressure);
-    DBG(" hPa\r\n");
-    delay(100);
 
     // RTCメモリーからデーターを読む
     ESP.rtcUserMemoryRead(0, (uint32_t*) &rtcData, sizeof(rtcData));
@@ -116,14 +102,61 @@ void setup()
     if ((crcOfData == rtcData.data.crc32) && 0 <= rtcData.data.restart && rtcData.data.restart < MaxRestart) {
         restart = rtcData.data.restart;
         valid = true;
+        sleeptime = (double)rtcData.data.sleeptime * COMP;
+        currenttime = rtcData.data.tbefore + (time_t)sleeptime;
     } else {
         restart = 0;
-        rtcData.data.nextAdjust = 0;
         valid = false;
+        sleeptime = 0;
+        currenttime = 0;
     }
+    setTime(currenttime);
+#ifdef _DEBUG
+    Serial.begin(115200);
+    delay(10);
+//    pinMode(LED, OUTPUT);
+#endif
+    DBG("\r\nStart\r\n");
+    if (valid) {
+        DBG("sleeptime: ");DBG(rtcData.data.sleeptime);
+        DBG(", tbefore: ");DBG(rtcData.data.tbefore);DBG("\r\n");
+    }
+    mcp3002.begin(MCP_CS);
+    bme280.begin(BME_CS);    //  Wi-Fi接続には時間がかかり、測定周期がぶれるので、
+                             //  Wi-Fi接続より先にセンサーを読んでしまう
+
+    double temp, humid, pressure, illumi;
+
+    temp = bme280.readTemperature();
+    humid = bme280.readHumidity();
+    pressure = bme280.readPressure();
+
+    mcp3002.readData(0);                   // リセット後、1回目のreadは値が0になってしまうので読み捨てる
+    illumi = (double)(mcp3002.readData(0));
+    illumi = illumi * 3.3 / 1024;          // 負荷抵抗両端の電圧
+    illumi = illumi / 1000 * 1000000 * 2;  // 負荷抵抗=1kΩ  l→Lux
+
+    int indx = restart - 1;
+    if (indx < 0) {
+        indx = MaxRestart - 1;
+    }
+    rtcData.data.blocks[indx].created = now();
+    rtcData.data.blocks[indx].temp = temp;
+    rtcData.data.blocks[indx].humid = humid;
+    rtcData.data.blocks[indx].pressure = pressure;
+    rtcData.data.blocks[indx].illumi = illumi;
+
+    DBG("currentTime: "); DBG(currenttime);
+    DBG(", temp: "); DBG(temp);
+    DBG(" DegC,  humid: "); DBG(humid);
+    DBG(" %, pressure: "); DBG(pressure);
+    DBG(" hPa, illumi: "); DBG(illumi);
+    DBG(" Lux\r\n");
+    delay(200);
 
     DBG("valid: ");DBG(valid);
     DBG(", restart: ");DBG(restart);DBG("\r\n");
+    delay(200);
 
     if (restart == 0) { // restartが0の時だけWi-Fiがオンになっている
         wifi_set_sleep_type(LIGHT_SLEEP_T);
@@ -137,49 +170,33 @@ void setup()
         DBG("WiFi connected\r\nIP address: ");
         DBG(WiFi.localIP()); DBG("\r\n");
 
-        //  RTCの初期化が必要か、次の時刻合わせの時刻なら
-        if (rx8025.needInit() || (valid && (rtcData.data.nextAdjust < currentTime))) {
-            time_t now = getSntpTime();  //  SNTPで時刻取得
-
-            DBG("init RX8025: ");DBG(now);DBG("\r\n");
-            rx8025.begin(SDA, SCL);
-            rx8025.writeRTC(now);
-            rtcData.data.nextAdjust = now + 24 * 3600;  //  次の時刻合わせを1日後に設定
-        } else {
-            DBG("Doesn't init RX8025\r\n");
-        }
+        time_t sntptime = getSntpTime();  //  SNTPで時刻取得
+        DBG("SNTP time: ");DBG(sntptime);DBG("\r\n");
+        setTime(sntptime);
     }
-
-    int indx = restart - 1;
-    if (indx < 0) {
-        indx = MaxRestart - 1;
-    }
-
-    rtcData.data.blocks[indx].created = currentTime;
-    rtcData.data.blocks[indx].temp = temp;
-    rtcData.data.blocks[indx].humid = humid;
-    rtcData.data.blocks[indx].pressure = pressure;
 
     if (restart == 0 && valid) {
-        sendDataToAmbient();
+        sendDataToAmbient(valid);
     }
 
     if (++restart >= MaxRestart) {
         restart = 0;
     }
+
     rtcData.data.restart = restart;
+    rtcData.data.tbefore = now();
+
+    t = millis() - t; // t: リスタート直後からの経過時間(ミリ秒)
+    t = (t < PERIOD * 1000) ? (PERIOD * 1000 - t) : 1;  // sleeptime(ミリ秒)
+
+    rtcData.data.sleeptime = (time_t)((double)t / 1000.0 / COMP);
     rtcData.data.crc32 = calcCRC32(((uint8_t*) &rtcData) + 4, sizeof(rtcData) - 4);
 
     // RTCメモリーにデーターを書く
     ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData));
 
-    t = millis() - t;
-    t = (t < PERIOD * 1000) ? (PERIOD * 1000 - t) : 1;
-    if (restart == 0) {
-        ESP.deepSleep(t * 1000, RF_DEFAULT);
-    } else {
-        ESP.deepSleep(t * 1000, RF_DISABLED);
-    }
+    ESP.deepSleep((int)(t * 1000.0 / COMP), (restart == 0) ? RF_DEFAULT : RF_DISABLED);
+
     delay(1000);
 }
 
@@ -217,37 +234,41 @@ uint32_t getSntpTime() {
     int cnt = 0;
     while (t == 0) {
         t = sntp_get_current_timestamp();
-        delay(10);
-        if (++cnt > 100) {
+        delay(20);
+        if (++cnt > 500) {
             break;
         }
     }
     return t;
 }
 
-#define BUFSIZE 400
+#define BUFSIZE 500
 
 char buffer[BUFSIZE];
 
-void sendDataToAmbient() {
+void sendDataToAmbient(bool valid) {
     int i;
     time_t created;
     int vb;
-    char tempbuf[12], humidbuf[12], pressurebuf[12], vbbuf[12];
+    char tempbuf[12], humidbuf[12], pressurebuf[12], illumibuf[12], vbbuf[12];
 
     ambient.begin(channelId, writeKey, &client);
 
     sprintf(buffer, "{\"writeKey\":\"%s\",\"data\":[", writeKey);
-    for (i = 0; i < MaxRestart; i++) {
+    if (valid) { // もしRTCデーターがvalidなら全部のデーターを送信
+        i = 0;
+    } else { // そうでないなら[MaxRestart - 1]のスロットだけ送信
+        i = MaxRestart - 1;
+    }
+    for (; i < MaxRestart; i++) {
 
         created = rtcData.data.blocks[i].created;
         dtostrf(rtcData.data.blocks[i].temp, 3, 1, tempbuf);
         dtostrf(rtcData.data.blocks[i].humid, 3, 1, humidbuf);
         dtostrf(rtcData.data.blocks[i].pressure, 3, 1, pressurebuf);
+        dtostrf(rtcData.data.blocks[i].illumi, 3, 1, illumibuf);
 
-        if (created) {
-            sprintf(&buffer[strlen(buffer)], "{\"created\":%d,\"time\":1,\"d1\":%s,\"d2\":%s,\"d3\":%s},", created, tempbuf, humidbuf, pressurebuf);
-        }
+        sprintf(&buffer[strlen(buffer)], "{\"created\":%d,\"time\":1,\"d1\":%s,\"d2\":%s,\"d3\":%s,\"d5\":%s},", created, tempbuf, humidbuf, pressurebuf, illumibuf);
     }
 
     vb = system_adc_read();
