@@ -10,9 +10,11 @@
  * restartの値により処理を分ける
  * restart==0  wi-fi onで起動。valid==trueならデーターを送信。
  * 
- * Wi-Fi接続に失敗したらConfigPortalを立ち上げ、外からssid、パスワードを設定。
- * 
  * ++restartし、バッファーに時刻とBME280の値を書く
+ * 
+ * RTCメモリーは電源を切ると消えるので、channelIdとwriteKeyは失われる。
+ * RTCメモリーがvalidでなければConfigPortalを立ち上げ、外からssid、パスワードを設定。
+ * 
  */
 #include <ESP8266WiFi.h>
 #include <SPI.h>
@@ -183,19 +185,23 @@ void setup()
         wifiManager.addParameter(&custom_ambient_writeKey);
 
 //        wifiManager.resetSettings();
-        wifiManager.autoConnect("Ambient setup");
+        if (valid) {
+            wifiManager.autoConnect("Ambient setup");
+        } else {
+            wifiManager.startConfigPortal("Ambient setup");
+        }
 
         //read updated parameters
         char channelId[16], writeKey[24];
         strcpy(channelId, custom_ambient_channelId.getValue());
-        DBG("channelId: ");DBG(channelId);DBG("\r\n");
         strcpy(writeKey, custom_ambient_writeKey.getValue());
-        DBG("writeKey: ");DBG(writeKey);DBG("\r\n");
 
         if (shouldSaveConfig) {
             rtcData.data.channelId = atoi(channelId);
             strcpy(rtcData.data.writeKey, writeKey);
         }
+        DBG("channelId: ");DBG(rtcData.data.channelId);DBG("\r\n");
+        DBG("writeKey: ");DBG(rtcData.data.writeKey);DBG("\r\n");
 
         DBG("WiFi connected\r\nIP address: ");
         DBG(WiFi.localIP()); DBG("\r\n");
